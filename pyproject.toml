@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "juxtabam"
+version = "0.1.0"
+description = "JuxtaBAM: A species and SNP-independent method to validate the integrity of joint epigenomic and transcriptomic profiling datasets"
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "pandas",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
