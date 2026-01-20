@@ -11,6 +11,9 @@ requires-python = ">=3.9"
 
 dependencies = [
     "pandas",
+    "numpy",
+    "matplotlib",
+    "seaborn",
 ]
 
 [tool.setuptools.packages.find]

@@ -19,7 +19,7 @@ The primary goal of JuxtaBAM is to verify sample identity across assays, detect 
 ## Requirements
 
 * Python >= 3.9
-* pandas
+* pandas, numpy, matplotlib, seaborn
 * GATK >= 4.1.9.0
 * samtools
 * bcftools
@@ -60,28 +60,40 @@ The reference genome file (.fa):
 * Must have a .dict file in the same directory
 * Must have a .fai index file in the same directory
 
-Read more about the reference genome dict and index file: https://gatk.broadinstitute.org/hc/en-us/articles/360035531652-FASTA-Reference-genome-format
+### Read more about the reference genome dict and index file:
+https://gatk.broadinstitute.org/hc/en-us/articles/360035531652-FASTA-Reference-genome-format
 ---
 
 ## Running the pipeline
 
 The main pipeline entry point is:
 
-python scripts/juxtabam_run.py [arguments]
+python -m scripts.juxtabam_run [arguments]
 
-### Minimal example
+### Example
+```
+python -m scripts.juxtabam_run \
+    --input_info input_info.tsv \
+    --reference mm10.fa \
+    --regions chr15,chr16,chr17 \
+    --threads 8 \
+    --min-dp 10 \
+    --output_dir juxtabam_output
+```
 
-python scripts/juxtabam_run.py 
---input_info input_info.tsv 
---reference mm10.fa 
---output_dir juxtabam_output
-
+And, subsequently for visualization:
+```
+python -m scripts.juxtabam_plot \
+    --genotype_mismatch_rates juxtabam_output/genotype_mismatch_rates.tsv \
+    --input_info input_info.tsv \
+    --outdir juxtabam_output/plots
+```
 ### Common options
 
 * --input_info: input manifest TSV file (required)
 * --reference: reference FASTA file (required). Must have .fai and .dict
 * --output_dir: base output directory (required)
-* --regions: genomic regions to analyze. Can be chr1 or chr15,chr16,chr17 . Or comma-separated list, BED file, or VCF file
+* --regions: genomic regions to analyze. Such as chr1 or chr2,chr3,chr4 . Comma-separated list, BED file, or VCF file
 * --threads: number of threads for GATK operations
 * --java_mem: Java memory setting passed to GATK (default="-Xmx32G")
 
@@ -89,7 +101,7 @@ python scripts/juxtabam_run.py
 ### Other options
 #### Read depth and variant filters
 
-* --min-dp: minimum read depth per SNP per sample (default: 20)
+* --min-dp: minimum read depth per SNP per sample to be genotyped (default: 20)
 * --min-qd: minimum QD value for variant filtering (default: 2.0)
 * --min-qual: minimum QUAL value for variant filtering (default: 30)
 
@@ -97,11 +109,11 @@ python scripts/juxtabam_run.py
 
 * --skip_AddOrReplaceRG: skip AddOrReplaceReadGroups
 * --skip_SplitNCigar: skip SplitNCigarReads
-* --call_SplitNCigar_for_assay_types: comma-separated assay names for which SplitNCigarReads is applied
+* --call_SplitNCigar_for_assay_types: comma-separated assay names for which SplitNCigarReads is applied (default: RNA, RNA-seq, RNAseq)
 
 #### Tool paths
 
-* --gatk_path: path to GATK executable (only if not in your system path)
+* --gatk_path: path to GATK executable (only needed if not already in your system path)
 * --samtools_path: path to samtools executable
 * --bcftools_path: path to bcftools executable
 
@@ -109,7 +121,11 @@ python scripts/juxtabam_run.py
 
 ## Slurm support
 
-JuxtaBAM can optionally offload expensive steps to Slurm.
+JuxtaBAM can optionally offload expensive steps to Slurm. For Slurm to find JuxtaBAM location, you may need to first install the package with `pip`.
+```
+cd /to/juxtabam/directory/
+pip install .
+```
 
 ### Slurm-enabled options
 
@@ -121,7 +137,7 @@ JuxtaBAM can optionally offload expensive steps to Slurm.
 When Slurm options are enabled, JuxtaBAM automatically generates sbatch scripts, submits jobs, and waits for completion. No manual Slurm scripting is required.
 
 ### Example Slurm run
-
+```
 python scripts/juxtabam_run.py 
 --input_info data/example_mouse_ENCODE/input_info.tsv 
 --reference data/mm10_data/mm10.fa 
@@ -133,7 +149,7 @@ python scripts/juxtabam_run.py
 --slurm_threads 1 
 --slurm_ram 40G 
 --slurm_pairwise_bcftools
-
+```
 The same command runs locally if Slurm flags are omitted.
 
 ---
@@ -142,13 +158,9 @@ The same command runs locally if Slurm flags are omitted.
 
 The main pipeline produces:
 
-* gvcf/: per-sample GVCF files
-* gendb/: GenomicsDB workspace
-* joint/: joint VCFs and filtered SNP sets
-* genotype_mismatch_rates.tsv: pairwise mismatch summary
-* genotype_mismatch_rates.csv: CSV version of results
+* genotype_mismatch_rates.tsv: pairwise mismatch summary (TSV and CSV)
 * nearest_neighbor_matches.tsv: closest genotype matches per sample
-* run_info.txt: run provenance and parameters
+* run_info.txt: run time information and parameters
 
 Mismatch metrics include:
 
@@ -164,7 +176,7 @@ Warnings are emitted if comparisons are based on few SNPs.
 
 Plot generation is handled by a separate script:
 
-python scripts/juxtabam_plot.py [arguments]
+python -m scripts.juxtabam_plot.py [arguments]
 
 Required inputs:
 
