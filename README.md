@@ -50,11 +50,8 @@ RNA_A20_SRR19241698&emsp;A20&emsp;RNA&emsp;/path/to/RNA_A20_SRR19241698_chr1.bam
 
 
 Each BAM file must:
-
 * Be sorted
 * Have a corresponding .bai index
-* Pass samtools quickcheck
-* Contain valid or fixable read group information
 
 The reference genome file (.fa):
 * Must have a .dict file in the same directory
