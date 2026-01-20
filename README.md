@@ -67,9 +67,9 @@ https://gatk.broadinstitute.org/hc/en-us/articles/360035531652-FASTA-Reference-g
 ## Running the pipeline
 
 The main pipeline entry point is:
-
+```
 python -m scripts.juxtabam_run [arguments]
-
+```
 ### Example
 ```
 python -m scripts.juxtabam_run \
@@ -175,9 +175,9 @@ Warnings are emitted if comparisons are based on few SNPs.
 ## Plotting and visualization
 
 Plot generation is handled by a separate script:
-
+```
 python -m scripts.juxtabam_plot.py [arguments]
-
+```
 Required inputs:
 
 * --genotype_mismatch_rates: output TSV from juxtabam_run.py
