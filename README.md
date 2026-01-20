@@ -191,18 +191,16 @@ Optional parameters:
 
 Generated figures include:
 
-* Cross-assay heatmaps
-* Bubble heatmaps
-* All-vs-all mismatch matrices
-* SNV site count distributions
-* Nearest-neighbor line plots
+* Heatmaps
+* Number of SNV site distributions (histograms)
+* Comparison of mismatch rates in each sample's paired sample and samples from other donors (line plots)
 
 ---
 
 ## Notes and recommendations
 
-* Strongly recommended: Limit regions during testing to reduce runtime (e.g., --regions chr19 or --regions chr1,chr2,chr3) and excluding the sex chromosomes
-* RNA-seq and other spliced assays should use SplitNCigarReads
+* <b>Strongly recommended</b>: Limit regions during testing to reduce runtime (e.g., --regions chr19 or --regions chr1,chr2,chr3) and exclude sex chromosomes
+* <b>Strongly recommended</b>: RNA-seq and other spliced assays should use SplitNCigarReads
 * Interpret mismatch rates in the context of coverage and other assays
 * Very low SNP counts may lead to unstable estimates
 * If the pipeline fails halfway, make sure you remove the partially-generated corrupted files (or the entire gendb/ directory for a failure in the GenomicImportDB step), before running again
