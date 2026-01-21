@@ -2,7 +2,7 @@
 
 JuxtaBAM (juxtaposing BAM files) is a Python-based tool for cross-assay genotype concordance and sample identity validation using joint SNV genotyping. It is designed to work across different sequencing assays such as RNA-seq, ATAC-seq, and DNase-seq, and is agnostic to species, reference genome, and variant sets.
 
-The primary goal of JuxtaBAM is to verify sample identity across assays, detect swaps or mislabeling, and quantify genotype mismatch ratesk.
+The primary goal of JuxtaBAM is to verify sample identity across assays, detect swaps or mislabeling, and quantify genotype mismatch rates.
 
 ---
 
@@ -58,7 +58,7 @@ The reference genome file (.fa):
 * Must have a .fai index file in the same directory
 
 ### Read more about the reference genome dict and index file:
-https://gatk.broadinstitute.org/hc/en-us/articles/360035531652-FASTA-Reference-genome-format
+[Reference genome index and dict files](https://gatk.broadinstitute.org/hc/en-us/articles/360035531652-FASTA-Reference-genome-format)
 ---
 
 ## Running the pipeline
