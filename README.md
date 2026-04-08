@@ -194,6 +194,40 @@ Generated figures include:
 
 ---
 
+## Statistical testing
+
+Bayesian cross-assay match and within-assay duplication tests are handled by a separate script:
+
+```
+python statistical_test.py --genotype_mismatch_rates <mismatch_rates.tsv> --input_info <input_info.tsv> [options]
+```
+
+Required inputs:
+
+* `--genotype_mismatch_rates`: output TSV from `juxtabam_run.py`
+* `--input_info`: same input manifest used for the run
+
+Optional parameters:
+
+* `--assay1`, `--assay2`: assay types to compare for the cross-assay match test (default: first two assay types found in `input_info` alphabetically)
+* `--alpha`: significance threshold before Bonferroni correction (default: 0.05)
+* `--outdir`: output directory for the p-value summary plot
+
+### Example
+
+```
+python statistical_test.py \
+    --genotype_mismatch_rates output/genotype_mismatch_rates.tsv \
+    --input_info input_info.tsv \
+    --assay1 ATAC \
+    --assay2 RNA \
+    --outdir output/stats/
+```
+
+Output includes a printed table of all test results sorted by p-value, with Bonferroni-corrected significance flags, and an optional `pvalue_summary.png` plot when `--outdir` is specified.
+
+---
+
 ## Notes and recommendations
 
 * <b>Strongly recommended</b>: Limit regions during testing to reduce runtime (e.g., --regions chr19 or --regions chr1,chr2,chr3) and exclude sex chromosomes
