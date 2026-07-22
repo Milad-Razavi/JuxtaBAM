@@ -1,491 +1,375 @@
-#!/usr/bin/env python3
 """
-Statistical test for detecting sample mislabeling and duplication
-from pairwise SNV mismatch rates produced by juxtabam_run.
+Statistical tests for sample mislabeling and duplication, from the pairwise SNV
+genotype comparisons produced by juxtabam_run.
 
-Tests performed:
-  1. Cross-assay match test: For each biosample with paired assays,
-     tests whether the observed mismatch rate is consistent with a
-     true match vs. a mismatch, using leave-one-out normal distributions.
-  2. Within-assay duplication test: For each pair of samples within the
-     same assay type, tests whether the pair is a duplicate vs. a true
-     non-duplicate.
+For each pair of samples the pipeline reports n SNV sites and m discordant (mismatched) genotypes.
+Discordance at a site is a Bernoulli event, but the underlying
+discordance probability varies from pair to pair and assay to assay.
+Letting the per-pair probability be random gives the beta-binomial:
+
+    m ~ BetaBinomial(n, alpha, beta)
+
+alpha and beta are fit by maximum likelihood to the other pairs of the same
+family, excluding the pair under test (leave one out).
+
+Two tests, each one-sided because the alternative can move the mismatch rate in
+only one direction:
+
+  Cross-assay mismatch test, for every unordered pair of assay types.
+    Null: the labeled pair is the same biosample. A swap raises the mismatch.
+    p = P(M >= m), the upper tail.
+
+  Within-assay duplication test, for every assay type.
+    Null: the pair is two different biosamples. A duplicate lowers the mismatch.
+    p = P(M <= m), the lower tail.
+
+Bonferroni correction is applied within each family of tests.
 
 Usage:
-  python -m scripts.statistical_test \\
+  python statistical_test.py \\
       --genotype_mismatch_rates output/genotype_mismatch_rates.tsv \\
-      --input_info input_info.tsv
-
-  Optional:
-      --assay1 ATAC --assay2 RNA    (default: first two distinct assay types)
-      --alpha 0.05                   (significance level, default 0.05)
+      --input_info input_info.tsv \\
+      --outdir stats_tables/ [--assays ATAC,RNA] [--out results.tsv]
 """
 
 import argparse
-import csv
-import math
 import os
 import sys
+from itertools import combinations
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.stats import betabinom
+
+MIN_REF_PAIRS = 3
+LOG_BOUNDS = ((-12.0, 25.0), (-12.0, 25.0))
+P_UNDERFLOW = 1e-300
 
 
 # ---------------------------------------------------------------
-# Math helpers (no scipy dependency)
+# Beta-binomial null
 # ---------------------------------------------------------------
 
-def norm_pdf(x, mu, sigma):
-    """Gaussian probability density function."""
-    if sigma <= 0:
-        return 0.0
-    z = (x - mu) / sigma
-    return math.exp(-0.5 * z * z) / (sigma * math.sqrt(2.0 * math.pi))
+def neg_log_lik(log_params, m, n):
+    alpha, beta = np.exp(log_params)
+    return -betabinom.logpmf(m, n, alpha, beta).sum()
 
 
-def mean_std(values):
-    """Return (mean, sample_std) for a list of floats."""
-    n = len(values)
-    if n < 2:
-        return (values[0] if n == 1 else 0.0), 0.0
-    mu = sum(values) / n
-    var = sum((v - mu) ** 2 for v in values) / (n - 1)
-    return mu, math.sqrt(var)
+def fit_null(m, n):
+    """
+    Maximum likelihood fit of (alpha, beta) to reference counts.
+
+    Returns (None, None) only if the optimizer returns a non-finite point.
+    """
+    res = minimize(neg_log_lik, (0.0, 0.0), args=(m, n),
+                   bounds=LOG_BOUNDS, method="L-BFGS-B")
+    if not np.all(np.isfinite(res.x)) or not np.isfinite(res.fun):
+        return None, None
+    alpha, beta = np.exp(res.x)
+    return float(alpha), float(beta)
+
+
+def tail_pvalue(m, n, alpha, beta, upper):
+    """
+    P(M >= m | n) if upper, else P(M <= m | n).
+
+    scipy's sf() is P(M > k).
+    """
+    if not upper:
+        return float(betabinom.cdf(m, n, alpha, beta))
+    if m < 1:
+        return 1.0
+    return float(betabinom.sf(m - 1, n, alpha, beta))
+
+
+def format_p(p):
+    """Render a p-value in scientific notation, or < 1e-300 if underflow."""
+    return f"{p:.4g}" if p > P_UNDERFLOW else f"< {P_UNDERFLOW:.0e}"
 
 
 # ---------------------------------------------------------------
 # I/O
 # ---------------------------------------------------------------
 
-def load_input_info(path):
-    """
-    Read the input_info manifest (tab or comma delimited).
-    Returns a list of dicts with keys: sample_id, biosample, assay, bam.
-    """
-    with open(path) as fh:
-        sample = fh.read(4096)
-        fh.seek(0)
-        dialect = csv.Sniffer().sniff(sample, delimiters="\t,")
-        reader = csv.DictReader(fh, dialect=dialect)
-        rows = list(reader)
+def load_inputs(rates_path, info_path):
+    """Read the manifest and the pairwise counts, annotated with biosample and assay."""
+    info = pd.read_csv(info_path, sep=None, engine="python")
+    missing = {"sample_id", "biosample", "assay"} - set(info.columns)
+    if missing:
+        raise ValueError(f"input_info is missing columns: {sorted(missing)}")
 
-    required = {"sample_id", "biosample", "assay"}
-    if not required.issubset(rows[0].keys()):
+    pairs = pd.read_csv(rates_path, sep=None, engine="python")
+    pairs.columns = [c.strip() for c in pairs.columns]
+    need = {"sample1", "sample2", "total_sites", "mismatches"}
+    if not need.issubset(pairs.columns):
         raise ValueError(
-            f"input_info must contain columns {required}; "
-            f"found {set(rows[0].keys())}"
+            f"genotype_mismatch_rates must contain {sorted(need)}; found "
+            f"{sorted(pairs.columns)}."
         )
-    return rows
+    if "percent_mismatch" not in pairs.columns:
+        pairs["percent_mismatch"] = 100 * pairs.mismatches / pairs.total_sites
 
-
-def load_mismatch_rates(path):
-    """
-    Read genotype_mismatch_rates.tsv produced by juxtabam_run.
-    Returns a symmetric lookup dict: (sample1, sample2) -> percent_mismatch.
-    """
-    lookup = {}
-    with open(path) as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        for row in reader:
-            s1, s2 = row["sample1"], row["sample2"]
-            val = float(row["percent_mismatch"])
-            lookup[(s1, s2)] = val
-            lookup[(s2, s1)] = val
-    return lookup
-
-
-def detect_assay_types(manifest_rows):
-    """Return sorted list of distinct assay types from the manifest."""
-    return sorted(set(r["assay"] for r in manifest_rows))
-
-
-def build_sample_maps(manifest_rows):
-    """
-    From the input_info manifest, build:
-      sid_to_bio  : sample_id -> biosample
-      sid_to_assay: sample_id -> assay
-      assay_bio_to_sids: (assay, biosample) -> [sample_id, ...]
-    """
-    sid_to_bio = {}
-    sid_to_assay = {}
-    assay_bio_to_sids = {}
-
-    for r in manifest_rows:
-        sid = r["sample_id"]
-        bio = r["biosample"]
-        assay = r["assay"]
-        sid_to_bio[sid] = bio
-        sid_to_assay[sid] = assay
-        assay_bio_to_sids.setdefault((assay, bio), []).append(sid)
-
-    return sid_to_bio, sid_to_assay, assay_bio_to_sids
+    meta = info.set_index("sample_id")[["biosample", "assay"]]
+    for i in ("1", "2"):
+        pairs = pairs.join(meta.add_suffix(i), on=f"sample{i}")
+    return pairs.dropna(subset=["biosample1", "biosample2"])
 
 
 # ---------------------------------------------------------------
-# Statistical tests
+# Tests
 # ---------------------------------------------------------------
 
-def cross_assay_match_test(lookup, sid_to_bio, sid_to_assay, assay1, assay2):
-    """
-    For every pair of samples (s1, s2) where s1 is assay1 and s2 is
-    assay2, classify it as a matched pair (same biosample) or mismatched
-    pair (different biosample).  Each sample_id is treated individually,
-    including replicates.
+def run_test(df, upper, family, test_type, min_sites):
+    """Leave-one-out beta-binomial tail test over the rows of df."""
+    if len(df) <= MIN_REF_PAIRS:
+        print(f"[warning] Family '{family}' has {len(df)} pair(s); more than "
+              f"{MIN_REF_PAIRS} are needed to fit a null. Skipping this family.")
+        return []
 
-    For each matched pair, test whether its mismatch rate is consistent
-    with the matched distribution vs. the mismatched distribution.
+    m = df.mismatches.to_numpy(dtype=int)
+    n = df.total_sites.to_numpy(dtype=int)
 
-    Returns a list of result dicts.
-    """
-    # Collect sample_ids by assay
-    sids_a1 = sorted(s for s, a in sid_to_assay.items() if a == assay1)
-    sids_a2 = sorted(s for s, a in sid_to_assay.items() if a == assay2)
+    out = []
+    for i, row in enumerate(df.itertuples()):
+        alpha, beta = fit_null(np.delete(m, i), np.delete(n, i))
+        if alpha is None:
+            print(f"[warning] Null fit returned a non-finite point for '{family}' "
+                  f"excluding {row.sample1},{row.sample2}. Skipping this pair.")
+            continue
+        out.append(dict(
+            family=family,
+            test_type=test_type,
+            sample1=row.sample1,
+            sample2=row.sample2,
+            biosample1=row.biosample1,
+            biosample2=row.biosample2,
+            obs_mismatch_percent=row.percent_mismatch,
+            mismatches=m[i],
+            total_sites=n[i],
+            alpha=alpha,
+            beta=beta,
+            exp_mismatch_percent=100 * alpha / (alpha + beta),
+            p_value=tail_pvalue(m[i], n[i], alpha, beta, upper),
+            low_sites=n[i] < min_sites,
+        ))
+    return out
 
-    # Partition all cross-assay pairs into matched vs mismatched
-    matched_pairs = {}   # (s1, s2) -> rate
-    mismatched_rates = []
 
-    for s1 in sids_a1:
-        for s2 in sids_a2:
-            rate = lookup.get((s1, s2))
-            if rate is None:
-                continue
-            if sid_to_bio[s1] == sid_to_bio[s2]:
-                matched_pairs[(s1, s2)] = rate
-            else:
-                mismatched_rates.append(rate)
+def cross_assay_mismatch_test(pairs, a1, a2, min_sites):
+    """Same biosample, one sample of each assay type. Upper tail."""
+    sel = pairs[
+        (pairs.biosample1 == pairs.biosample2)
+        & (((pairs.assay1 == a1) & (pairs.assay2 == a2))
+           | ((pairs.assay1 == a2) & (pairs.assay2 == a1)))
+    ]
+    return run_test(sel, True, f"{a1}__{a2}", "cross_assay_mismatch", min_sites)
 
-    n_matched = len(matched_pairs)
-    if n_matched < 3:
-        print(f"[warning] Only {n_matched} matched cross-assay pairs between "
-              f"{assay1} and {assay2}; need at least 3 for meaningful statistics.")
-        if n_matched < 2:
-            return []
 
-    mu_mismatch, sigma_mismatch = mean_std(mismatched_rates)
-    matched_vals = list(matched_pairs.values())
+def within_assay_duplication_test(pairs, assay, min_sites):
+    """Same assay type, different biosamples. Lower tail."""
+    sel = pairs[
+        (pairs.assay1 == assay) & (pairs.assay2 == assay)
+        & (pairs.biosample1 != pairs.biosample2)
+    ]
+    return run_test(sel, False, assay, "within_assay_duplication", min_sites)
 
+
+def run_all_tests(pairs, assays, min_sites):
     results = []
-    for (s1, s2), x_i in sorted(matched_pairs.items()):
-        # Leave-one-out for the matched distribution
-        other_matched = [v for k, v in matched_pairs.items() if k != (s1, s2)]
-        mu_match, sigma_match = mean_std(other_matched)
-
-        f_match = norm_pdf(x_i, mu_match, sigma_match)
-        f_mismatch = norm_pdf(x_i, mu_mismatch, sigma_mismatch)
-
-        denom = f_match + f_mismatch
-        p_match = f_match / denom if denom > 0 else 0.5
-
-        bio = sid_to_bio[s1]
-        label = f"{assay1}-{assay2}:{s1},{s2}" if s1 != f"{assay1}_{bio}" or s2 != f"{assay2}_{bio}" else f"{assay1}-{assay2}:{bio}"
-
-        results.append({
-            "test": "match",
-            "label": label,
-            "observed": x_i,
-            "mu_mismatch": mu_mismatch,
-            "sigma_mismatch": sigma_mismatch,
-            "mu_ref": mu_match,
-            "sigma_ref": sigma_match,
-            "f_ref": f_match,
-            "f_alt": f_mismatch,
-            "p_value": p_match,
-            "p_label": f"p-match:{p_match:.3g}",
-        })
-
+    for a1, a2 in combinations(assays, 2):
+        results += cross_assay_mismatch_test(pairs, a1, a2, min_sites)
+    for assay in assays:
+        results += within_assay_duplication_test(pairs, assay, min_sites)
     return results
 
 
-def within_assay_duplication_test(lookup, sid_to_bio, sid_to_assay, assay):
-    """
-    For every pair of samples (s1, s2) within the same assay type that
-    belong to different biosamples, test whether the pair is a
-    duplicate.  Each sample_id is treated individually.
-
-    Returns a list of result dicts.
-    """
-    sids = sorted(s for s, a in sid_to_assay.items() if a == assay)
-
-    # Collect all within-assay pairs from different biosamples
-    pair_rates = {}
-    for i, s1 in enumerate(sids):
-        for s2 in sids[i + 1:]:
-            if sid_to_bio[s1] == sid_to_bio[s2]:
-                continue  # same biosample (replicates), skip
-            rate = lookup.get((s1, s2))
-            if rate is not None:
-                pair_rates[(s1, s2)] = rate
-
-    if len(pair_rates) < 3:
-        print(f"[warning] Only {len(pair_rates)} cross-biosample pairs for "
-              f"assay {assay}; need at least 3 for meaningful duplication "
-              f"statistics.")
-        if len(pair_rates) < 2:
-            return []
-
-    all_rates = list(pair_rates.values())
-    mu_mismatch, sigma_mismatch = mean_std(all_rates)
-
-    results = []
-    for (s1, s2), x_ij in pair_rates.items():
-        f_mismatch = norm_pdf(x_ij, mu_mismatch, sigma_mismatch)
-        f_dupl = norm_pdf(x_ij, 0, sigma_mismatch)
-
-        denom = f_mismatch + f_dupl
-        p_nondupl = f_mismatch / denom if denom > 0 else 0.5
-
-        bio1, bio2 = sid_to_bio[s1], sid_to_bio[s2]
-        label = f"{assay}:{s1},{s2}" if s1 != f"{assay}_{bio1}" or s2 != f"{assay}_{bio2}" else f"{assay}:{bio1}-{bio2}"
-
-        results.append({
-            "test": "duplication",
-            "label": label,
-            "observed": x_ij,
-            "mu_mismatch": mu_mismatch,
-            "sigma_mismatch": sigma_mismatch,
-            "mu_ref": 0.0,
-            "sigma_ref": sigma_mismatch,
-            "f_ref": f_dupl,
-            "f_alt": f_mismatch,
-            "p_value": p_nondupl,
-            "p_label": f"p-nondupl:{p_nondupl:.3g}",
-        })
-
-    return results
+def apply_bonferroni(results, alpha):
+    """Bonferroni within each family: threshold = alpha / (tests in that family)."""
+    df = pd.DataFrame(results)
+    df["n_tests"] = df.groupby(["test_type", "family"])["family"].transform("size")
+    df["threshold"] = alpha / df.n_tests
+    df["significant"] = df.p_value < df.threshold
+    df["adjusted_p"] = np.minimum(1.0, df.p_value * df.n_tests)
+    return df.sort_values(["test_type", "family", "p_value"]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------
-# Output
+# Reporting
 # ---------------------------------------------------------------
 
-def print_results(all_results, bonferroni_threshold):
-    """Print sorted table of all test results."""
-    all_results.sort(key=lambda r: (r["p_value"], r["observed"]))
+TEST_LEGEND = {
+    "cross_assay_mismatch": [
+        "Cross-assay mismatch test: null is 'same biosample'; upper tail P(M >= m).",
+        "A small p means the pair is more discordant than a true match should be,",
+        "suggesting a swap or mislabel.",
+    ],
+    "within_assay_duplication": [
+        "Within-assay duplication test: null is 'different biosamples'; lower tail",
+        "P(M <= m). A small p means the pair is more concordant than two distinct",
+        "sources should be, suggesting a duplicate.",
+    ],
+}
 
-    hdr = (f"{'p-value':>12s}  {'label':<30s}  {'observed':>8s}  "
-           f"{'mu_mis':>8s}  {'sig_mis':>8s}  {'mu_ref':>8s}  "
-           f"{'sig_ref':>8s}  {'f_ref':>12s}  {'f_alt':>12s}  "
-           f"{'result':<30s}")
-    sep = "=" * len(hdr)
 
-    print(sep)
-    print(hdr)
-    print(sep)
+def _header(alpha, assays):
+    return [
+        "=" * 100,
+        "JuxtaBAM statistical tests: sample mislabeling and duplication",
+        "=" * 100,
+        "",
+        f"Assay types        : {', '.join(assays)}",
+        f"Significance level : alpha = {alpha}",
+        "Correction         : Bonferroni, applied within each test family",
+        "",
+    ]
 
-    for r in all_results:
-        flag = "***" if r["p_value"] < bonferroni_threshold else ""
-        print(
-            f"{r['p_value']:>12.3g}  {r['label']:<30s}  "
-            f"{r['observed']:>8.3f}  "
-            f"{r['mu_mismatch']:>8.3f}  {r['sigma_mismatch']:>8.3f}  "
-            f"{r['mu_ref']:>8.3f}  {r['sigma_ref']:>8.3f}  "
-            f"{r['f_ref']:>12.3g}  {r['f_alt']:>12.3g}  "
-            f"{r['p_label']:<30s} {flag}"
+
+def family_table(test_type, family, sub, alpha):
+    n_tests = int(sub.n_tests.iloc[0])
+    thr = float(sub.threshold.iloc[0])
+    lines = [
+        f"Family: {test_type} / {family}",
+        f"  tests in family      : {n_tests}",
+        f"  Bonferroni threshold : {alpha} / {n_tests} = {thr:.6g}",
+        "",
+    ]
+    hdr = (f"  {'p_value':>12s}  {'adjusted_p':>12s}  {'sample1':<32s} {'sample2':<32s} "
+           f"{'obs_mismatch_percent':>20s} {'mism':>9s} {'total_sites':>11s} "
+           f"{'exp_mismatch_percent':>20s} {'alpha':>10s} {'beta':>12s}  flag")
+    lines.append(hdr)
+    lines.append("  " + "-" * (len(hdr) - 2))
+    for r in sub.itertuples():
+        flag = "***" if r.significant else ("low_n" if r.low_sites else "")
+        lines.append(
+            f"  {format_p(r.p_value):>12s}  {format_p(r.adjusted_p):>12s}  "
+            f"{r.sample1:<32s} {r.sample2:<32s} "
+            f"{r.obs_mismatch_percent:>20.3f} {r.mismatches:>9d} {r.total_sites:>11d} "
+            f"{r.exp_mismatch_percent:>20.3f} {r.alpha:>10.4f} {r.beta:>12.4f}  {flag}"
         )
-
-    flagged = [r for r in all_results if r["p_value"] < bonferroni_threshold]
-    print(f"\n{sep}")
-    print(f"Flagged results (p < {bonferroni_threshold:.4g}):")
-    if flagged:
-        for r in flagged:
-            print(f"  {r['p_label']:>40s}  {r['label']}")
-    else:
-        print("  None")
+    lines.append("")
+    lines.append(f"  *** marks p below the family Bonferroni threshold ({thr:.6g}).")
+    if sub.low_sites.any():
+        lines.append("  low_n marks a comparison resting on few usable SNV sites; its null is")
+        lines.append("  wide, so a non-significant result there is weak evidence.")
+    lines.append("")
+    return lines
 
 
-# ---------------------------------------------------------------
-# Visualization
-# ---------------------------------------------------------------
+def summary_table(df, alpha, assays):
+    lines = _header(alpha, assays)
+    lines += ["=" * 100, "FAMILIES TESTED", "=" * 100, ""]
 
-def plot_pvalue_summary(match_results, dupl_results_by_assay,
-                        bonferroni_threshold, outdir):
-    """
-    Strip chart of all p-values on -log10 scale, grouped by test type.
-    Flagged results (above -log10 threshold) are labeled.
+    # Size the text columns to the actual data, so long assay or family names
+    # never overflow a fixed width and shift the columns after them.
+    groups = list(df.groupby(["test_type", "family"], sort=False))
+    tt_w = max([len("test type")] + [len(tt) for (tt, _), _ in groups])
+    fam_w = max([len("family")] + [len(fam) for (_, fam), _ in groups])
 
-    Parameters
-    ----------
-    match_results : list of result dicts from cross_assay_match_test
-    dupl_results_by_assay : list of (assay_name, results_list) tuples
-    bonferroni_threshold : float
-    outdir : str or path
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("[warning] matplotlib not available; skipping plot.")
-        return
+    lines.append(f"  {'test type':<{tt_w}s}  {'family':<{fam_w}s}  {'tests':>7s}  "
+                 f"{'threshold':>12s}  {'flagged':>8s}")
+    lines.append("  " + "-" * (tt_w + fam_w + 7 + 12 + 8 + 8))
+    for (test_type, family), sub in groups:
+        lines.append(f"  {test_type:<{tt_w}s}  {family:<{fam_w}s}  "
+                     f"{int(sub.n_tests.iloc[0]):>7d}  "
+                     f"{float(sub.threshold.iloc[0]):>12.6g}  "
+                     f"{int(sub.significant.sum()):>8d}")
+    lines += ["", "=" * 100, "FLAGGED COMPARISONS", "=" * 100, ""]
 
-    n_groups = 1 + len(dupl_results_by_assay)
-    fig, ax = plt.subplots(figsize=(2.5 + 1.8 * n_groups, 5))
+    hits = df[df.significant]
+    if hits.empty:
+        lines.append("  None. No comparison falls below its family Bonferroni threshold.")
+        lines.append("")
+    for r in hits.itertuples():
+        reason = ("elevated mismatch, possible swap or mislabel"
+                  if r.test_type == "cross_assay_mismatch"
+                  else "unexpectedly low mismatch, possible duplicate")
+        lines.append(f"  [{r.test_type} / {r.family}]  {r.sample1} vs {r.sample2}")
+        lines.append(f"      obs_mismatch_percent {r.obs_mismatch_percent:.3f}%  "
+                     f"(exp_mismatch_percent {r.exp_mismatch_percent:.3f}%),  "
+                     f"{r.mismatches} / {r.total_sites} total_sites,  p = {format_p(r.p_value)}")
+        lines.append(f"      {reason}")
+        lines.append("")
 
-    colors = ["#2ca02c", "#4393c3", "#e6550d", "#9467bd", "#8c564b"]
-    threshold_neglog = -math.log10(bonferroni_threshold)
+    weak = df[(~df.significant) & df.low_sites]
+    if not weak.empty:
+        lines.append(f"[note] {len(weak)} comparison(s) rest on fewer than the minimum "
+                     f"site count; their")
+        lines.append("       nulls are wide, so a non-significant result there is weak "
+                     "evidence.")
+        lines.append("")
+    return lines
 
-    # Group 0: match test
-    x_pos = 0
-    tick_labels = []
-    match_label = match_results[0]["label"].split(":")[0] if match_results else "match"
-    tick_labels.append(f"{match_label}\nmatch")
 
-    match_p_neglog = [-math.log10(r["p_value"]) for r in match_results]
-    ax.scatter([x_pos] * len(match_p_neglog), match_p_neglog, alpha=0.5, s=25,
-               color=colors[0], zorder=3)
-
-    for r, neglog_p in zip(match_results, match_p_neglog):
-        if r["p_value"] < bonferroni_threshold:
-            bio = r["label"].split(":")[-1]
-            ax.annotate(bio, (x_pos, neglog_p),
-                        fontsize=9, ha="left", color="#d62728",
-                        xytext=(8, 0), textcoords="offset points")
-
-    # Groups 1..N: duplication tests per assay
-    for idx, (assay_name, dupl_results) in enumerate(dupl_results_by_assay):
-        x_pos = idx + 1
-        tick_labels.append(f"{assay_name}\nduplication")
-        c = colors[(idx + 1) % len(colors)]
-
-        dupl_p_neglog = [-math.log10(r["p_value"]) for r in dupl_results]
-        ax.scatter([x_pos] * len(dupl_p_neglog), dupl_p_neglog, alpha=0.35, s=18,
-                   color=c, zorder=3)
-
-        for r, neglog_p in zip(dupl_results, dupl_p_neglog):
-            if r["p_value"] < bonferroni_threshold:
-                pair = r["label"].split(":")[-1]
-                ax.annotate(pair, (x_pos, neglog_p),
-                            fontsize=9, ha="left", color="#d62728",
-                            xytext=(8, 0), textcoords="offset points")
-
-    ax.axhline(threshold_neglog, color="black", linestyle="--",
-               linewidth=1, label=f"Bonferroni",
-               zorder=2)
-
-    ax.set_xticks(range(len(tick_labels)))
-    ax.set_xticklabels(tick_labels, fontsize=10)
-    ax.set_ylabel("-log10(p-value)")
-    ax.set_title("Statistical test results")
-    ax.legend(fontsize=9, loc="upper right")
-    ax.set_xlim(-0.5, len(tick_labels) - 0.5)
-    plt.tight_layout()
-
+def write_tables(df, alpha, assays, outdir):
     os.makedirs(outdir, exist_ok=True)
-    out_path = os.path.join(outdir, "pvalue_summary.png")
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-    print(f"\nSaved plot: {out_path}")
+    written = []
 
+    path = os.path.join(outdir, "summary.txt")
+    with open(path, "w") as fh:
+        fh.write("\n".join(summary_table(df, alpha, assays)) + "\n")
+    written.append(path)
 
-# ---------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Detect sample mislabeling and duplication from pairwise "
-            "SNV mismatch rates produced by juxtabam_run."
-        )
-    )
-    parser.add_argument(
-        "--genotype_mismatch_rates", required=True,
-        help="Path to genotype_mismatch_rates.tsv from juxtabam_run."
-    )
-    parser.add_argument(
-        "--input_info", required=True,
-        help="Path to input_info manifest (same file used for juxtabam_run)."
-    )
-    parser.add_argument(
-        "--assay1", default=None,
-        help="First assay type for cross-assay match test "
-             "(default: first assay type found in input_info)."
-    )
-    parser.add_argument(
-        "--assay2", default=None,
-        help="Second assay type for cross-assay match test "
-             "(default: second assay type found in input_info)."
-    )
-    parser.add_argument(
-        "--alpha", type=float, default=0.05,
-        help="Significance level for Bonferroni correction (default: 0.05)."
-    )
-    parser.add_argument(
-        "--outdir", default=None,
-        help="Output directory for plots. If not specified, no plot is generated."
-    )
-
-    return parser.parse_args()
+    for (test_type, family), sub in df.groupby(["test_type", "family"], sort=False):
+        safe = family.replace("/", "_")
+        path = os.path.join(outdir, f"{test_type}__{safe}.txt")
+        lines = (_header(alpha, assays) + TEST_LEGEND[test_type] + [""]
+                 + family_table(test_type, family, sub, alpha))
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        written.append(path)
+    return written
 
 
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser(
+        description="Detect sample mislabeling and duplication from JuxtaBAM "
+                    "pairwise SNV genotype comparisons.")
+    ap.add_argument("--genotype_mismatch_rates", required=True)
+    ap.add_argument("--input_info", required=True)
+    ap.add_argument("--outdir", required=True,
+                    help="Directory for the per-family tables and the summary.")
+    ap.add_argument("--assays", default=None,
+                    help="Comma-separated assay types to test. Default: all found.")
+    ap.add_argument("--alpha", type=float, default=0.05,
+                    help="Family-wise significance level (default 0.05).")
+    ap.add_argument("--min_sites", type=int, default=50,
+                    help="Annotate comparisons resting on fewer usable SNV sites.")
+    ap.add_argument("--out", default=None,
+                    help="Also write the combined result table as TSV.")
+    args = ap.parse_args()
 
-    # Load data
-    manifest_rows = load_input_info(args.input_info)
-    lookup = load_mismatch_rates(args.genotype_mismatch_rates)
-    sid_to_bio, sid_to_assay, assay_bio_to_sids = build_sample_maps(manifest_rows)
+    pairs = load_inputs(args.genotype_mismatch_rates, args.input_info)
 
-    # Resolve assay types
-    all_assays = detect_assay_types(manifest_rows)
-    print(f"Assay types found in input_info: {all_assays}")
+    found = sorted(pd.unique(pd.concat([pairs.assay1, pairs.assay2]).dropna()))
+    if args.assays:
+        assays = [a.strip() for a in args.assays.split(",") if a.strip()]
+        unknown = set(assays) - set(found)
+        if unknown:
+            sys.exit(f"[error] assay type(s) not in the data: {sorted(unknown)}. "
+                     f"Available: {found}")
+    else:
+        assays = found
 
-    if len(all_assays) < 2:
-        print("[error] Need at least two distinct assay types for "
-              "cross-assay match testing.")
-        sys.exit(1)
+    print(f"Assay types found : {found}")
+    print(f"Assay types tested: {assays}")
+    if len(assays) < 2:
+        print("[warning] Fewer than two assay types; no cross-assay test is possible.")
 
-    assay1 = args.assay1 if args.assay1 else all_assays[0]
-    assay2 = args.assay2 if args.assay2 else all_assays[1]
+    results = run_all_tests(pairs, assays, args.min_sites)
+    if not results:
+        sys.exit("[error] No testable pairs found.")
 
-    if assay1 not in all_assays:
-        print(f"[error] --assay1 '{assay1}' not found in input_info. "
-              f"Available: {all_assays}")
-        sys.exit(1)
-    if assay2 not in all_assays:
-        print(f"[error] --assay2 '{assay2}' not found in input_info. "
-              f"Available: {all_assays}")
-        sys.exit(1)
-    if assay1 == assay2:
-        print("[error] --assay1 and --assay2 must be different assay types.")
-        sys.exit(1)
+    df = apply_bonferroni(results, args.alpha)
 
-    # Count shared biosamples
-    bios_a1 = {bio for (a, bio) in assay_bio_to_sids if a == assay1}
-    bios_a2 = {bio for (a, bio) in assay_bio_to_sids if a == assay2}
-    shared = sorted(bios_a1 & bios_a2)
-    print(f"Testing {assay1} vs {assay2}: "
-          f"{len(shared)} shared biosamples\n")
+    print()
+    print("\n".join(summary_table(df, args.alpha, assays)))
 
-    # Run tests
-    match_results = cross_assay_match_test(
-        lookup, sid_to_bio, sid_to_assay, assay1, assay2
-    )
-    dupl_results_a1 = within_assay_duplication_test(
-        lookup, sid_to_bio, sid_to_assay, assay1
-    )
-    dupl_results_a2 = within_assay_duplication_test(
-        lookup, sid_to_bio, sid_to_assay, assay2
-    )
-
-    all_results = match_results + dupl_results_a1 + dupl_results_a2
-
-    n_tests = len(all_results)
-    bonferroni_threshold = args.alpha / n_tests if n_tests > 0 else args.alpha
-    print(f"Total tests: {n_tests} "
-          f"({len(match_results)} match + "
-          f"{len(dupl_results_a1)} {assay1}-dupl + "
-          f"{len(dupl_results_a2)} {assay2}-dupl)")
-    print(f"Bonferroni threshold ({args.alpha}/{n_tests}): "
-          f"{bonferroni_threshold:.4g}\n")
-
-    print_results(all_results, bonferroni_threshold)
-
-    if args.outdir:
-        plot_pvalue_summary(
-            match_results,
-            [(assay1, dupl_results_a1), (assay2, dupl_results_a2)],
-            bonferroni_threshold,
-            args.outdir,
-        )
+    for path in write_tables(df, args.alpha, assays, args.outdir):
+        print(f"Wrote: {path}")
+    if args.out:
+        df.to_csv(args.out, sep="\t", index=False)
+        print(f"Wrote: {args.out}")
 
 
 if __name__ == "__main__":
